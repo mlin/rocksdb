@@ -328,7 +328,7 @@ Iterator* Version::NewConcatenatingIterator(const ReadOptions& options,
     }
   }
   return NewTwoLevelIterator(level_iter, &GetFileIterator, vset_->table_cache_,
-                             options, soptions, vset_->icmp_);
+                             options, soptions, vset_->env_, vset_->icmp_);
 }
 
 void Version::AddIterators(const ReadOptions& options,
@@ -2270,7 +2270,7 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
         // Create concatenating iterator for the files from this level
         list[num++] = NewTwoLevelIterator(
             new Version::LevelFileNumIterator(icmp_, c->inputs(which)),
-            &GetFileIterator, table_cache_, options, storage_options_, icmp_,
+            &GetFileIterator, table_cache_, options, storage_options_, env_, icmp_,
             true /* for compaction */);
       }
     }

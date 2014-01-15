@@ -31,7 +31,7 @@ extern Iterator* NewTwoLevelIterator(
         void* arg, const ReadOptions& options, const EnvOptions& soptions,
         const InternalKeyComparator& internal_comparator,
         const Slice& index_value, bool for_compaction),
-    void* arg, const ReadOptions& options, const EnvOptions& soptions,
+    void* arg, const ReadOptions& options, const EnvOptions& soptions, Env* env, 
     const InternalKeyComparator& internal_comparator,
     bool for_compaction = false);
 

@@ -28,7 +28,7 @@ class TwoLevelIterator: public Iterator {
  public:
   TwoLevelIterator(Iterator* index_iter, BlockFunction block_function,
                    void* arg, const ReadOptions& options,
-                   const EnvOptions& soptions,
+                   const EnvOptions& soptions, Env* env,
                    const InternalKeyComparator& internal_comparator,
                    bool for_compaction);
 
@@ -75,6 +75,7 @@ class TwoLevelIterator: public Iterator {
   void* arg_;
   const ReadOptions options_;
   const EnvOptions& soptions_;
+  Env* env_;
   const InternalKeyComparator& internal_comparator_;
   Status status_;
   PeekingIteratorWrapper index_iter_;
@@ -87,12 +88,13 @@ class TwoLevelIterator: public Iterator {
 
 TwoLevelIterator::TwoLevelIterator(
     Iterator* index_iter, BlockFunction block_function, void* arg,
-    const ReadOptions& options, const EnvOptions& soptions,
+    const ReadOptions& options, const EnvOptions& soptions, Env* env,
     const InternalKeyComparator& internal_comparator, bool for_compaction)
     : block_function_(block_function),
       arg_(arg),
       options_(options),
       soptions_(soptions),
+      env_(env),
       internal_comparator_(internal_comparator),
       index_iter_(index_iter),
       data_iter_(nullptr),
@@ -192,11 +194,11 @@ void TwoLevelIterator::InitDataBlock() {
 Iterator* NewTwoLevelIterator(Iterator* index_iter,
                               BlockFunction block_function, void* arg,
                               const ReadOptions& options,
-                              const EnvOptions& soptions,
+                              const EnvOptions& soptions, Env* env,
                               const InternalKeyComparator& internal_comparator,
                               bool for_compaction) {
   return new TwoLevelIterator(index_iter, block_function, arg, options,
-                              soptions, internal_comparator, for_compaction);
+                              soptions, env, internal_comparator, for_compaction);
 }
 
 }  // namespace rocksdb

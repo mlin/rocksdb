@@ -900,7 +900,8 @@ Iterator* BlockBasedTable::NewIterator(const ReadOptions& options) {
   return NewTwoLevelIterator(NewIndexIterator(options),
                              &BlockBasedTable::DataBlockReader,
                              const_cast<BlockBasedTable*>(this), options,
-                             rep_->soptions, rep_->internal_comparator);
+                             rep_->soptions, rep_->options.env,
+                             rep_->internal_comparator);
 }
 
 Status BlockBasedTable::Get(
