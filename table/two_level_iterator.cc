@@ -79,7 +79,7 @@ class TwoLevelIterator: public Iterator {
   const EnvOptions& soptions_;
   const Env* env_;
   Status status_;
-  IteratorWrapper index_iter_;
+  PeekingIteratorWrapper index_iter_;
   IteratorWrapper data_iter_; // May be nullptr
   // If data_iter_ is non-nullptr, then "data_block_handle_" holds the
   // "index_value" passed to block_function_ to create the data_iter_.
