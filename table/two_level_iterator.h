@@ -35,7 +35,7 @@ extern Iterator* NewTwoLevelIterator(
     void* arg,
     const ReadOptions& options,
     const EnvOptions& soptions,
-    const Env* env,
+    Env* env,
     bool for_compaction = false);
 
 }  // namespace rocksdb
