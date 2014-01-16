@@ -474,7 +474,9 @@ extern void rocksdb_readoptions_set_read_tier(
     rocksdb_readoptions_t*, int);
 extern void rocksdb_readoptions_set_tailing(
     rocksdb_readoptions_t*, unsigned char);
-
+extern void rocksdb_readoptions_set_prefetch(
+    rocksdb_readoptions_t*,
+    unsigned char);
 /* Write options */
 
 extern rocksdb_writeoptions_t* rocksdb_writeoptions_create();
