@@ -817,6 +817,12 @@ struct ReadOptions {
   // Default: false
   bool tailing;
 
+  // If true, forward-moving iterators will attempt to use a background thread
+  // to prime caches with upcoming blocks. Can reduce I/O and decompression
+  // stalls during bulk scans of large databases, especially on rotating
+  // disks.
+  bool prefetch;
+
   ReadOptions()
       : verify_checksums(true),
         fill_cache(true),
@@ -824,7 +830,8 @@ struct ReadOptions {
         snapshot(nullptr),
         prefix(nullptr),
         read_tier(kReadAllTier),
-        tailing(false) {}
+        tailing(false),
+        prefetch(false) {}
   ReadOptions(bool cksum, bool cache)
       : verify_checksums(cksum),
         fill_cache(cache),
@@ -832,7 +839,8 @@ struct ReadOptions {
         snapshot(nullptr),
         prefix(nullptr),
         read_tier(kReadAllTier),
-        tailing(false) {}
+        tailing(false),
+        prefetch(false) {}
 };
 
 // Options that control write operations

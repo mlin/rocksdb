@@ -901,7 +901,9 @@ Iterator* BlockBasedTable::NewIterator(const ReadOptions& options) {
                              &BlockBasedTable::DataBlockReader,
                              const_cast<BlockBasedTable*>(this), options,
                              rep_->soptions, rep_->options.env,
-                             rep_->internal_comparator);
+                             rep_->internal_comparator,
+                             false, // for_compaction
+                             true); // can_prefetch: allow block prefetching if requested in options
 }
 
 Status BlockBasedTable::Get(

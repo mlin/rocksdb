@@ -25,6 +25,11 @@ class InternalKeyComparator;
 //
 // Uses a supplied function to convert an index_iter value into
 // an iterator over the contents of the corresponding block.
+//
+// If can_prefetch and options.prefetch are both true, then the two-level
+// iterator may env->Schedule() tasks on background threads to prefetch
+// upcoming lower-level blocks during forward iteration. In this case,
+// block_function must be thread-safe.
 extern Iterator* NewTwoLevelIterator(
     Iterator* index_iter,
     Iterator* (*block_function)(
@@ -33,6 +38,6 @@ extern Iterator* NewTwoLevelIterator(
         const Slice& index_value, bool for_compaction),
     void* arg, const ReadOptions& options, const EnvOptions& soptions, Env* env, 
     const InternalKeyComparator& internal_comparator,
-    bool for_compaction = false);
+    bool for_compaction = false, bool can_prefetech = false);
 
 }  // namespace rocksdb
