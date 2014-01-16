@@ -43,7 +43,8 @@ class TwoLevelIterator: public Iterator {
     const ReadOptions& options,
     const EnvOptions& soptions,
     Env* env,
-    bool for_compaction);
+    bool for_compaction,
+    bool can_prefetch);
 
   virtual ~TwoLevelIterator();
 
@@ -96,6 +97,7 @@ class TwoLevelIterator: public Iterator {
   // "index_value" passed to block_function_ to create the data_iter_.
   std::string data_block_handle_;
   bool for_compaction_;
+  bool can_prefetch_;
 
   PrefetchState* prefetch_;
   void PrefetchThread();
@@ -109,7 +111,8 @@ TwoLevelIterator::TwoLevelIterator(
     const ReadOptions& options,
     const EnvOptions& soptions,
     Env *env,
-    bool for_compaction)
+    bool for_compaction,
+    bool can_prefetch)
     : block_function_(block_function),
       arg_(arg),
       options_(options),
@@ -118,6 +121,7 @@ TwoLevelIterator::TwoLevelIterator(
       index_iter_(index_iter),
       data_iter_(nullptr),
       for_compaction_(for_compaction),
+      can_prefetch_(can_prefetch),
       prefetch_(nullptr) {
 }
 
@@ -126,9 +130,14 @@ TwoLevelIterator::~TwoLevelIterator() {
     // Await completion of any outstanding background prefetching task, since
     // it assumes existence of this
     // FIXME: avoid spinlock
-    while (true) {
-      MutexLock l(&prefetch_->mu);
+    // FIXME: deadlocks if no background threads are configured.
+    //        env_->Schedule does not give any feedback if this is the case!
+    {
+      MutexLock l0(&prefetch_->mu);
       prefetch_->data_block_handle_to_prefetch.clear();
+    }
+    while (true) {
+      MutexLock l1(&prefetch_->mu);
       if (!prefetch_->outstanding) {
         break;
       }
@@ -184,10 +193,9 @@ void TwoLevelIterator::SkipEmptyDataBlocksForward() {
       return;
     }
     index_iter_.Next();
-    if (options_.prefetch && options_.read_tier == kReadAllTier
-        && !for_compaction_ && index_iter_.HasNext()) {
+    if (can_prefetch_ && options_.prefetch && !for_compaction_ && index_iter_.HasNext()) {
       Slice next_data_block_handle = index_iter_.NextValue();
-      if (!prefetch_) {
+      if (prefetch_ == nullptr) {
         prefetch_ = new PrefetchState;
       }
       MutexLock l(&prefetch_->mu);
@@ -271,9 +279,10 @@ Iterator* NewTwoLevelIterator(
     const ReadOptions& options,
     const EnvOptions& soptions,
     Env *env,
-    bool for_compaction) {
+    bool for_compaction,
+    bool can_prefetch) {
   return new TwoLevelIterator(index_iter, block_function, arg,
-                              options, soptions, env, for_compaction);
+                              options, soptions, env, for_compaction, can_prefetch);
 }
 
 }  // namespace rocksdb
