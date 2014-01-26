@@ -9,6 +9,9 @@
 
 #include "db/compaction_picker.h"
 
+#include <limits>
+#include "util/statistics.h"
+
 namespace rocksdb {
 
 namespace {
@@ -21,6 +24,21 @@ uint64_t TotalFileSize(const std::vector<FileMetaData*>& files) {
   return sum;
 }
 
+// Multiple two operands. If they overflow, return op1.
+uint64_t MultiplyCheckOverflow(uint64_t op1, int op2) {
+  if (op1 == 0) {
+    return 0;
+  }
+  if (op2 <= 0) {
+    return op1;
+  }
+  uint64_t casted_op2 = (uint64_t) op2;
+  if (std::numeric_limits<uint64_t>::max() / op1 < casted_op2) {
+    return op1;
+  }
+  return op1 * casted_op2;
+}
+
 }  // anonymous namespace
 
 CompactionPicker::CompactionPicker(const Options* options,
@@ -29,15 +47,7 @@ CompactionPicker::CompactionPicker(const Options* options,
       options_(options),
       num_levels_(options->num_levels),
       icmp_(icmp) {
-  Init();
-}
 
-void CompactionPicker::ReduceNumberOfLevels(int new_levels) {
-  num_levels_ = new_levels;
-  Init();
-}
-
-void CompactionPicker::Init() {
   max_file_size_.reset(new uint64_t[NumberLevels()]);
   level_max_bytes_.reset(new uint64_t[NumberLevels()]);
   int target_file_size_multiplier = options_->target_file_size_multiplier;
@@ -47,10 +57,11 @@ void CompactionPicker::Init() {
       max_file_size_[i] = ULLONG_MAX;
       level_max_bytes_[i] = options_->max_bytes_for_level_base;
     } else if (i > 1) {
-      max_file_size_[i] = max_file_size_[i - 1] * target_file_size_multiplier;
-      level_max_bytes_[i] =
-          level_max_bytes_[i - 1] * max_bytes_multiplier *
-          options_->max_bytes_for_level_multiplier_additional[i - 1];
+      max_file_size_[i] = MultiplyCheckOverflow(max_file_size_[i - 1],
+                                                target_file_size_multiplier);
+      level_max_bytes_[i] = MultiplyCheckOverflow(
+          MultiplyCheckOverflow(level_max_bytes_[i - 1], max_bytes_multiplier),
+          options_->max_bytes_for_level_multiplier_additional[i - 1]);
     } else {
       max_file_size_[i] = options_->target_file_size_base;
       level_max_bytes_[i] = options_->max_bytes_for_level_base;
@@ -132,26 +143,16 @@ void CompactionPicker::GetRange(const std::vector<FileMetaData*>& inputs1,
   GetRange(all, smallest, largest);
 }
 
-// Add more files to the inputs on "level" to make sure that
-// no newer version of a key is compacted to "level+1" while leaving an older
-// version in a "level". Otherwise, any Get() will search "level" first,
-// and will likely return an old/stale value for the key, since it always
-// searches in increasing order of level to find the value. This could
-// also scramble the order of merge operands. This function should be
-// called any time a new Compaction is created, and its inputs_[0] are
-// populated.
-//
-// Will set c to nullptr if it is impossible to apply this compaction.
-void CompactionPicker::ExpandWhileOverlapping(Compaction* c) {
+bool CompactionPicker::ExpandWhileOverlapping(Compaction* c) {
   // If inputs are empty then there is nothing to expand.
   if (!c || c->inputs_[0].empty()) {
-    return;
+    return true;
   }
 
   // GetOverlappingInputs will always do the right thing for level-0.
   // So we don't need to do any expansion if level == 0.
   if (c->level() == 0) {
-    return;
+    return true;
   }
 
   const int level = c->level();
@@ -182,9 +183,9 @@ void CompactionPicker::ExpandWhileOverlapping(Compaction* c) {
                                &parent_index))) {
     c->inputs_[0].clear();
     c->inputs_[1].clear();
-    delete c;
-    c = nullptr;
+    return false;
   }
+  return true;
 }
 
 uint64_t CompactionPicker::ExpandedCompactionByteSizeLimit(int level) {
@@ -341,8 +342,8 @@ Compaction* CompactionPicker::CompactRange(Version* version, int input_level,
                                  MaxGrandParentOverlapBytes(input_level));
 
   c->inputs_[0] = inputs;
-  ExpandWhileOverlapping(c);
-  if (c == nullptr) {
+  if (ExpandWhileOverlapping(c) == false) {
+    delete c;
     Log(options_->info_log, "Could not compact due to expansion failure.\n");
     return nullptr;
   }
@@ -383,8 +384,10 @@ Compaction* LevelCompactionPicker::PickCompaction(Version* version) {
     level = version->compaction_level_[i];
     if ((version->compaction_score_[i] >= 1)) {
       c = PickCompactionBySize(version, level, version->compaction_score_[i]);
-      ExpandWhileOverlapping(c);
-      if (c != nullptr) {
+      if (ExpandWhileOverlapping(c) == false) {
+        delete c;
+        c = nullptr;
+      } else {
         break;
       }
     }
@@ -408,7 +411,9 @@ Compaction* LevelCompactionPicker::PickCompaction(Version* version) {
         c->inputs_[0].push_back(f);
         c->parent_index_ = parent_index;
         c->input_version_->file_to_compact_ = nullptr;
-        ExpandWhileOverlapping(c);
+        if (ExpandWhileOverlapping(c) == false) {
+          return nullptr;
+        }
       }
     }
   }
@@ -528,7 +533,7 @@ Compaction* LevelCompactionPicker::PickCompactionBySize(Version* version,
   }
 
   // store where to start the iteration in the next call to PickCompaction
-  c->input_version_->next_file_to_compact_by_size_[level] = nextIndex;
+  version->next_file_to_compact_by_size_[level] = nextIndex;
 
   return c;
 }
@@ -600,10 +605,8 @@ Compaction* UniversalCompactionPicker::PickCompaction(Version* version) {
   }
 
   // update statistics
-  if (options_->statistics != nullptr) {
-    options_->statistics->measureTime(NUM_FILES_IN_SINGLE_COMPACTION,
-                                      c->inputs_[0].size());
-  }
+  MeasureTime(options_->statistics.get(), NUM_FILES_IN_SINGLE_COMPACTION,
+              c->inputs_[0].size());
 
   // mark all the files that are being compacted
   c->MarkFilesBeingCompacted(true);

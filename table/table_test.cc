@@ -12,7 +12,8 @@
 #include <vector>
 
 #include "db/dbformat.h"
-#include "db/db_statistics.h"
+#include "rocksdb/statistics.h"
+#include "util/statistics.h"
 #include "db/memtable.h"
 #include "db/write_batch_internal.h"
 #include "rocksdb/cache.h"
@@ -242,13 +243,12 @@ class BlockConstructor: public Constructor {
 
 class BlockBasedTableConstructor: public Constructor {
  public:
-  explicit BlockBasedTableConstructor(
-      const Comparator* cmp)
-      : Constructor(cmp) {
-  }
+  explicit BlockBasedTableConstructor(const Comparator* cmp)
+      : Constructor(cmp) {}
   ~BlockBasedTableConstructor() {
     Reset();
   }
+
   virtual Status FinishImpl(const Options& options, const KVMap& data) {
     Reset();
     sink_.reset(new StringSink());
@@ -276,7 +276,6 @@ class BlockBasedTableConstructor: public Constructor {
     // Open the table
     uniq_id_ = cur_uniq_id_++;
     source_.reset(new StringSource(sink_->contents(), uniq_id_));
-    unique_ptr<TableFactory> table_factory;
     return options.table_factory->GetTableReader(options, soptions,
                                                  std::move(source_),
                                                  sink_->contents().size(),
@@ -935,18 +934,12 @@ TEST(TableTest, NumBlockStat) {
 class BlockCacheProperties {
  public:
   explicit BlockCacheProperties(Statistics* statistics) {
-    block_cache_miss =
-      statistics->getTickerCount(BLOCK_CACHE_MISS);
-    block_cache_hit =
-      statistics->getTickerCount(BLOCK_CACHE_HIT);
-    index_block_cache_miss =
-      statistics->getTickerCount(BLOCK_CACHE_INDEX_MISS);
-    index_block_cache_hit =
-      statistics->getTickerCount(BLOCK_CACHE_INDEX_HIT);
-    data_block_cache_miss =
-      statistics->getTickerCount(BLOCK_CACHE_DATA_MISS);
-    data_block_cache_hit =
-      statistics->getTickerCount(BLOCK_CACHE_DATA_HIT);
+    block_cache_miss = statistics->getTickerCount(BLOCK_CACHE_MISS);
+    block_cache_hit = statistics->getTickerCount(BLOCK_CACHE_HIT);
+    index_block_cache_miss = statistics->getTickerCount(BLOCK_CACHE_INDEX_MISS);
+    index_block_cache_hit = statistics->getTickerCount(BLOCK_CACHE_INDEX_HIT);
+    data_block_cache_miss = statistics->getTickerCount(BLOCK_CACHE_DATA_MISS);
+    data_block_cache_hit = statistics->getTickerCount(BLOCK_CACHE_DATA_HIT);
   }
 
   // Check if the fetched props matches the expected ones.
@@ -984,6 +977,11 @@ TEST(TableTest, BlockCacheTest) {
   options.create_if_missing = true;
   options.statistics = CreateDBStatistics();
   options.block_cache = NewLRUCache(1024);
+
+  // Enable the cache for index/filter blocks
+  BlockBasedTableOptions table_options;
+  table_options.cache_index_and_filter_blocks = true;
+  options.table_factory.reset(new BlockBasedTableFactory(table_options));
   std::vector<std::string> keys;
   KVMap kvmap;
 
@@ -1296,7 +1294,6 @@ TEST(MemTableTest, Simple) {
   delete iter;
   delete memtable->Unref();
 }
-
 
 }  // namespace rocksdb
 

@@ -14,13 +14,15 @@
 #include <gflags/gflags.h>
 #include "db/db_impl.h"
 #include "db/version_set.h"
-#include "db/db_statistics.h"
+#include "rocksdb/statistics.h"
 #include "rocksdb/options.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/write_batch.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/slice_transform.h"
 #include "rocksdb/statistics.h"
 #include "port/port.h"
 #include "util/bit_set.h"
@@ -30,6 +32,7 @@
 #include "util/random.h"
 #include "util/stack_trace.h"
 #include "util/string_util.h"
+#include "util/statistics.h"
 #include "util/testutil.h"
 #include "hdfs/env_hdfs.h"
 #include "utilities/merge_operators.h"
@@ -357,9 +360,9 @@ static bool ValidateCompressionLevel(const char* flagname, int32_t value) {
   return true;
 }
 
-static const bool FLAGS_compression_level_dummy =
-  google::RegisterFlagValidator(&FLAGS_compression_level,
-                                &ValidateCompressionLevel);
+static const bool FLAGS_compression_level_dummy __attribute__((unused)) =
+    google::RegisterFlagValidator(&FLAGS_compression_level,
+                                  &ValidateCompressionLevel);
 
 DEFINE_int32(min_level_to_compress, -1, "If non-negative, compression starts"
              " from this level. Levels with number < min_level_to_compress are"

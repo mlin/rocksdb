@@ -27,9 +27,6 @@ class CompactionPicker {
   CompactionPicker(const Options* options, const InternalKeyComparator* icmp);
   virtual ~CompactionPicker();
 
-  // See VersionSet::ReduceNumberOfLevels()
-  void ReduceNumberOfLevels(int new_levels);
-
   // Pick level and inputs for a new compaction.
   // Returns nullptr if there is no compaction to be done.
   // Otherwise returns a pointer to a heap-allocated object that
@@ -85,7 +82,17 @@ class CompactionPicker {
                 const std::vector<FileMetaData*>& inputs2,
                 InternalKey* smallest, InternalKey* largest);
 
-  void ExpandWhileOverlapping(Compaction* c);
+  // Add more files to the inputs on "level" to make sure that
+  // no newer version of a key is compacted to "level+1" while leaving an older
+  // version in a "level". Otherwise, any Get() will search "level" first,
+  // and will likely return an old/stale value for the key, since it always
+  // searches in increasing order of level to find the value. This could
+  // also scramble the order of merge operands. This function should be
+  // called any time a new Compaction is created, and its inputs_[0] are
+  // populated.
+  //
+  // Will return false if it is impossible to apply this compaction.
+  bool ExpandWhileOverlapping(Compaction* c);
 
   uint64_t ExpandedCompactionByteSizeLimit(int level);
 
@@ -110,8 +117,6 @@ class CompactionPicker {
 
   const Options* const options_;
  private:
-  void Init();
-
   int num_levels_;
 
   const InternalKeyComparator* const icmp_;

@@ -15,11 +15,6 @@
 #include <vector>
 #include <stdint.h>
 
-#include "rocksdb/memtablerep.h"
-#include "rocksdb/slice.h"
-#include "rocksdb/slice_transform.h"
-#include "rocksdb/statistics.h"
-#include "rocksdb/table_properties.h"
 #include "rocksdb/universal_compaction.h"
 
 namespace rocksdb {
@@ -34,6 +29,11 @@ class Logger;
 class MergeOperator;
 class Snapshot;
 class TableFactory;
+class MemTableRepFactory;
+class TablePropertiesCollector;
+class Slice;
+class SliceTransform;
+class Statistics;
 
 using std::shared_ptr;
 
@@ -717,6 +717,11 @@ struct ReadOptions {
   // disks.
   bool prefetch;
 
+  // Specify to create a tailing iterator -- a special iterator that has a
+  // view of the complete database (i.e. it can also be used to read newly
+  // added data) and is optimized for sequential reads.
+  bool tailing;
+
   ReadOptions()
       : verify_checksums(false),
         fill_cache(true),
@@ -724,7 +729,8 @@ struct ReadOptions {
         snapshot(nullptr),
         prefix(nullptr),
         read_tier(kReadAllTier),
-        prefetch(false) {}
+        prefetch(false),
+        tailing(false) {}
   ReadOptions(bool cksum, bool cache)
       : verify_checksums(cksum),
         fill_cache(cache),
@@ -732,7 +738,8 @@ struct ReadOptions {
         snapshot(nullptr),
         prefix(nullptr),
         read_tier(kReadAllTier),
-        prefetch(false) {}
+        prefetch(false),
+        tailing(false) {}
 };
 
 // Options that control write operations

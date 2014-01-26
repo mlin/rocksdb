@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "db/builder.h"
@@ -32,6 +33,7 @@
 #include "db/prefix_filter_iterator.h"
 #include "db/table_cache.h"
 #include "db/table_properties_collector.h"
+#include "db/tailing_iter.h"
 #include "db/transaction_log_impl.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
@@ -262,8 +264,10 @@ DBImpl::DBImpl(const Options& options, const std::string& dbname)
       bg_cv_(&mutex_),
       mem_rep_factory_(options_.memtable_factory.get()),
       mem_(new MemTable(internal_comparator_, options_)),
+      imm_(options_.min_write_buffer_number_to_merge),
       logfile_number_(0),
       super_version_(nullptr),
+      super_version_number_(0),
       tmp_batch_(),
       bg_compaction_scheduled_(0),
       bg_manual_only_(0),
@@ -357,7 +361,7 @@ DBImpl::~DBImpl() {
     delete mem_->Unref();
   }
 
-  imm_.UnrefAll(&to_delete);
+  imm_.current()->Unref(&to_delete);
   for (MemTable* m: to_delete) {
     delete m;
   }
@@ -505,7 +509,7 @@ bool DBImpl::SuperVersion::Unref() {
 
 void DBImpl::SuperVersion::Cleanup() {
   assert(refs.load(std::memory_order_relaxed) == 0);
-  imm.UnrefAll(&to_delete);
+  imm->Unref(&to_delete);
   MemTable* m = mem->Unref();
   if (m != nullptr) {
     to_delete.push_back(m);
@@ -513,13 +517,13 @@ void DBImpl::SuperVersion::Cleanup() {
   current->Unref();
 }
 
-void DBImpl::SuperVersion::Init(MemTable* new_mem, const MemTableList& new_imm,
+void DBImpl::SuperVersion::Init(MemTable* new_mem, MemTableListVersion* new_imm,
                                 Version* new_current) {
   mem = new_mem;
   imm = new_imm;
   current = new_current;
   mem->Ref();
-  imm.RefAll();
+  imm->Ref();
   current->Ref();
   refs.store(1, std::memory_order_relaxed);
 }
@@ -860,14 +864,11 @@ void DBImpl::PurgeObsoleteWALFiles() {
   }
 }
 
-// If externalTable is set, then apply recovered transactions
-// to that table. This is used for readonly mode.
-Status DBImpl::Recover(VersionEdit* edit, MemTable* external_table,
-                       bool error_if_log_file_exist) {
+Status DBImpl::Recover(bool read_only, bool error_if_log_file_exist) {
   mutex_.AssertHeld();
 
   assert(db_lock_ == nullptr);
-  if (!external_table) {
+  if (!read_only) {
     // We call CreateDirIfMissing() as the directory may already exist (if we
     // are reopening a DB), when this happens we don't want creating the
     // directory to cause an error. However, we need to check if creating the
@@ -948,12 +949,12 @@ Status DBImpl::Recover(VersionEdit* edit, MemTable* external_table,
 
     // Recover in the order in which the logs were generated
     std::sort(logs.begin(), logs.end());
-    for (size_t i = 0; i < logs.size(); i++) {
-      s = RecoverLogFile(logs[i], edit, &max_sequence, external_table);
+    for (size_t i = 0; s.ok() && i < logs.size(); i++) {
       // The previous incarnation may not have written any MANIFEST
       // records after allocating this log number.  So we manually
       // update the file number allocation counter in VersionSet.
       versions_->MarkFileNumberUsed(logs[i]);
+      s = RecoverLogFile(logs[i], &max_sequence, read_only);
     }
 
     if (s.ok()) {
@@ -968,10 +969,8 @@ Status DBImpl::Recover(VersionEdit* edit, MemTable* external_table,
   return s;
 }
 
-Status DBImpl::RecoverLogFile(uint64_t log_number,
-                              VersionEdit* edit,
-                              SequenceNumber* max_sequence,
-                              MemTable* external_table) {
+Status DBImpl::RecoverLogFile(uint64_t log_number, SequenceNumber* max_sequence,
+                              bool read_only) {
   struct LogReporter : public log::Reader::Reporter {
     Env* env;
     Logger* info_log;
@@ -987,6 +986,8 @@ Status DBImpl::RecoverLogFile(uint64_t log_number,
   };
 
   mutex_.AssertHeld();
+
+  VersionEdit edit;
 
   // Open the log file
   std::string fname = LogFileName(options_.wal_dir, log_number);
@@ -1017,11 +1018,8 @@ Status DBImpl::RecoverLogFile(uint64_t log_number,
   std::string scratch;
   Slice record;
   WriteBatch batch;
-  MemTable* mem = nullptr;
-  if (external_table) {
-    mem = external_table;
-  }
-  while (reader.ReadRecord(&record, &scratch) && status.ok()) {
+  bool memtable_empty = true;
+  while (reader.ReadRecord(&record, &scratch)) {
     if (record.size() < 12) {
       reporter.Corruption(
           record.size(), Status::Corruption("log record too small"));
@@ -1029,14 +1027,11 @@ Status DBImpl::RecoverLogFile(uint64_t log_number,
     }
     WriteBatchInternal::SetContents(&batch, record);
 
-    if (mem == nullptr) {
-      mem = new MemTable(internal_comparator_, options_);
-      mem->Ref();
-    }
-    status = WriteBatchInternal::InsertInto(&batch, mem, &options_);
+    status = WriteBatchInternal::InsertInto(&batch, mem_, &options_);
+    memtable_empty = false;
     MaybeIgnoreError(&status);
     if (!status.ok()) {
-      break;
+      return status;
     }
     const SequenceNumber last_seq =
         WriteBatchInternal::Sequence(&batch) +
@@ -1045,28 +1040,44 @@ Status DBImpl::RecoverLogFile(uint64_t log_number,
       *max_sequence = last_seq;
     }
 
-    if (!external_table &&
-        mem->ApproximateMemoryUsage() > options_.write_buffer_size) {
-      status = WriteLevel0TableForRecovery(mem, edit);
+    if (!read_only &&
+        mem_->ApproximateMemoryUsage() > options_.write_buffer_size) {
+      status = WriteLevel0TableForRecovery(mem_, &edit);
+      // we still want to clear memtable, even if the recovery failed
+      delete mem_->Unref();
+      mem_ = new MemTable(internal_comparator_, options_);
+      mem_->Ref();
+      memtable_empty = true;
       if (!status.ok()) {
         // Reflect errors immediately so that conditions like full
         // file-systems cause the DB::Open() to fail.
-        break;
+        return status;
       }
-      delete mem->Unref();
-      mem = nullptr;
     }
   }
 
-  if (status.ok() && mem != nullptr && !external_table) {
-    status = WriteLevel0TableForRecovery(mem, edit);
-    // Reflect errors immediately so that conditions like full
-    // file-systems cause the DB::Open() to fail.
+  if (!memtable_empty && !read_only) {
+    status = WriteLevel0TableForRecovery(mem_, &edit);
+    delete mem_->Unref();
+    mem_ = new MemTable(internal_comparator_, options_);
+    mem_->Ref();
+    if (!status.ok()) {
+      return status;
+    }
   }
 
-  if (mem != nullptr && !external_table) {
-    delete mem->Unref();
+  if (edit.NumEntries() > 0) {
+    // if read_only, NumEntries() will be 0
+    assert(!read_only);
+    // writing log number in the manifest means that any log file
+    // with number strongly less than (log_number + 1) is already
+    // recovered and should be ignored on next reincarnation.
+    // Since we already recovered log_number, we want all logs
+    // with numbers `<= log_number` (includes this one) to be ignored
+    edit.SetLogNumber(log_number + 1);
+    status = versions_->LogAndApply(&edit, &mutex_);
   }
+
   return status;
 }
 
@@ -1211,7 +1222,7 @@ Status DBImpl::FlushMemTableToOutputFile(bool* madeProgress,
   mutex_.AssertHeld();
   assert(imm_.size() != 0);
 
-  if (!imm_.IsFlushPending(options_.min_write_buffer_number_to_merge)) {
+  if (!imm_.IsFlushPending()) {
     Log(options_.info_log, "FlushMemTableToOutputFile already in progress");
     Status s = Status::IOError("FlushMemTableToOutputFile already in progress");
     return s;
@@ -1278,11 +1289,16 @@ Status DBImpl::FlushMemTableToOutputFile(bool* madeProgress,
   return s;
 }
 
-void DBImpl::CompactRange(const Slice* begin,
-                          const Slice* end,
-                          bool reduce_level,
-                          int target_level) {
-  FlushMemTable(FlushOptions());
+Status DBImpl::CompactRange(const Slice* begin,
+                            const Slice* end,
+                            bool reduce_level,
+                            int target_level) {
+  Status s = FlushMemTable(FlushOptions());
+  if (!s.ok()) {
+    LogFlush(options_.info_log);
+    return s;
+  }
+
   int max_level_with_files = 1;
   {
     MutexLock l(&mutex_);
@@ -1298,16 +1314,22 @@ void DBImpl::CompactRange(const Slice* begin,
     // bottom-most level, the output level will be the same as input one
     if (options_.compaction_style == kCompactionStyleUniversal ||
         level == max_level_with_files) {
-      RunManualCompaction(level, level, begin, end);
+      s = RunManualCompaction(level, level, begin, end);
     } else {
-      RunManualCompaction(level, level + 1, begin, end);
+      s = RunManualCompaction(level, level + 1, begin, end);
+    }
+    if (!s.ok()) {
+      LogFlush(options_.info_log);
+      return s;
     }
   }
 
   if (reduce_level) {
-    ReFitLevel(max_level_with_files, target_level);
+    s = ReFitLevel(max_level_with_files, target_level);
   }
   LogFlush(options_.info_log);
+
+  return s;
 }
 
 // return the same level if it cannot be moved
@@ -1326,7 +1348,7 @@ int DBImpl::FindMinimumEmptyLevelFitting(int level) {
   return minimum_level;
 }
 
-void DBImpl::ReFitLevel(int level, int target_level) {
+Status DBImpl::ReFitLevel(int level, int target_level) {
   assert(level < NumberLevels());
 
   SuperVersion* superversion_to_free = nullptr;
@@ -1340,7 +1362,7 @@ void DBImpl::ReFitLevel(int level, int target_level) {
     mutex_.Unlock();
     Log(options_.info_log, "ReFitLevel: another thread is refitting");
     delete new_superversion;
-    return;
+    return Status::NotSupported("another thread is refitting");
   }
   refitting_level_ = true;
 
@@ -1361,6 +1383,7 @@ void DBImpl::ReFitLevel(int level, int target_level) {
 
   assert(to_level <= level);
 
+  Status status;
   if (to_level < level) {
     Log(options_.info_log, "Before refitting:\n%s",
         versions_->current()->DebugString().data());
@@ -1374,7 +1397,7 @@ void DBImpl::ReFitLevel(int level, int target_level) {
     Log(options_.info_log, "Apply version edit:\n%s",
         edit.DebugString().data());
 
-    auto status = versions_->LogAndApply(&edit, &mutex_);
+    status = versions_->LogAndApply(&edit, &mutex_);
     superversion_to_free = InstallSuperVersion(new_superversion);
     new_superversion = nullptr;
 
@@ -1392,6 +1415,7 @@ void DBImpl::ReFitLevel(int level, int target_level) {
   mutex_.Unlock();
   delete superversion_to_free;
   delete new_superversion;
+  return status;
 }
 
 int DBImpl::NumberLevels() {
@@ -1404,6 +1428,10 @@ int DBImpl::MaxMemCompactionLevel() {
 
 int DBImpl::Level0StopWriteTrigger() {
   return options_.level0_stop_writes_trigger;
+}
+
+uint64_t DBImpl::CurrentVersionNumber() const {
+  return super_version_number_.load();
 }
 
 Status DBImpl::Flush(const FlushOptions& options) {
@@ -1600,10 +1628,10 @@ Status DBImpl::AppendSortedWalsOfType(const std::string& path,
   return status;
 }
 
-void DBImpl::RunManualCompaction(int input_level,
-                                 int output_level,
-                                 const Slice* begin,
-                                 const Slice* end) {
+Status DBImpl::RunManualCompaction(int input_level,
+                                   int output_level,
+                                   const Slice* begin,
+                                   const Slice* end) {
   assert(input_level >= 0);
 
   InternalKey begin_storage, end_storage;
@@ -1670,15 +1698,16 @@ void DBImpl::RunManualCompaction(int input_level,
   assert(!manual.in_progress);
   assert(bg_manual_only_ > 0);
   --bg_manual_only_;
+  return manual.status;
 }
 
-void DBImpl::TEST_CompactRange(int level,
-                               const Slice* begin,
-                               const Slice* end) {
+Status DBImpl::TEST_CompactRange(int level,
+                                 const Slice* begin,
+                                 const Slice* end) {
   int output_level = (options_.compaction_style == kCompactionStyleUniversal)
                          ? level
                          : level + 1;
-  RunManualCompaction(level, output_level, begin, end);
+  return RunManualCompaction(level, output_level, begin, end);
 }
 
 Status DBImpl::FlushMemTable(const FlushOptions& options) {
@@ -1734,8 +1763,7 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
   } else if (shutting_down_.Acquire_Load()) {
     // DB is being deleted; no more background compactions
   } else {
-    bool is_flush_pending =
-      imm_.IsFlushPending(options_.min_write_buffer_number_to_merge);
+    bool is_flush_pending = imm_.IsFlushPending();
     if (is_flush_pending &&
         (bg_flush_scheduled_ < options_.max_background_flushes)) {
       // memtable flush needed
@@ -1770,8 +1798,7 @@ void DBImpl::BGWorkCompaction(void* db) {
 Status DBImpl::BackgroundFlush(bool* madeProgress,
                                DeletionState& deletion_state) {
   Status stat;
-  while (stat.ok() &&
-         imm_.IsFlushPending(options_.min_write_buffer_number_to_merge)) {
+  while (stat.ok() && imm_.IsFlushPending()) {
     Log(options_.info_log,
         "BackgroundCallFlush doing FlushMemTableToOutputFile, flush slots available %d",
         options_.max_background_flushes - bg_flush_scheduled_);
@@ -1891,7 +1918,7 @@ Status DBImpl::BackgroundCompaction(bool* madeProgress,
   mutex_.AssertHeld();
 
   // TODO: remove memtable flush from formal compaction
-  while (imm_.IsFlushPending(options_.min_write_buffer_number_to_merge)) {
+  while (imm_.IsFlushPending()) {
     Log(options_.info_log,
         "BackgroundCompaction doing FlushMemTableToOutputFile, compaction slots "
         "available %d",
@@ -1977,6 +2004,7 @@ Status DBImpl::BackgroundCompaction(bool* madeProgress,
   if (is_manual) {
     ManualCompaction* m = manual_compaction_;
     if (!status.ok()) {
+      m->status = status;
       m->done = true;
     }
     // For universal compaction:
@@ -2296,7 +2324,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact,
       const uint64_t imm_start = env_->NowMicros();
       LogFlush(options_.info_log);
       mutex_.Lock();
-      if (imm_.IsFlushPending(options_.min_write_buffer_number_to_merge)) {
+      if (imm_.IsFlushPending()) {
         FlushMemTableToOutputFile(nullptr, deletion_state);
         bg_cv_.SignalAll();  // Wakeup MakeRoomForWrite() if necessary
       }
@@ -2564,9 +2592,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact,
 
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros - imm_micros;
-  if (options_.statistics.get()) {
-    options_.statistics.get()->measureTime(COMPACTION_TIME, stats.micros);
-  }
+  MeasureTime(options_.statistics.get(), COMPACTION_TIME, stats.micros);
   stats.files_in_leveln = compact->compaction->num_input_files(0);
   stats.files_in_levelnp1 = compact->compaction->num_input_files(1);
 
@@ -2631,8 +2657,9 @@ Status DBImpl::DoCompactionWork(CompactionState* compact,
 namespace {
 struct IterState {
   port::Mutex* mu;
-  Version* version;
-  std::vector<MemTable*> mem; // includes both mem_ and imm_
+  Version* version = nullptr;
+  MemTable* mem = nullptr;
+  MemTableListVersion* imm = nullptr;
   DBImpl *db;
 };
 
@@ -2641,17 +2668,23 @@ static void CleanupIteratorState(void* arg1, void* arg2) {
   DBImpl::DeletionState deletion_state(state->db->GetOptions().
                                        max_write_buffer_number);
   state->mu->Lock();
-  for (unsigned int i = 0; i < state->mem.size(); i++) {
-    MemTable* m = state->mem[i]->Unref();
+  if (state->mem) { // not set for immutable iterator
+    MemTable* m = state->mem->Unref();
     if (m != nullptr) {
       deletion_state.memtables_to_free.push_back(m);
     }
   }
-  state->version->Unref();
+  if (state->version) {  // not set for memtable-only iterator
+    state->version->Unref();
+  }
+  if (state->imm) {  // not set for memtable-only iterator
+    state->imm->Unref(&deletion_state.memtables_to_free);
+  }
   // fast path FindObsoleteFiles
   state->db->FindObsoleteFiles(deletion_state, false, true);
   state->mu->Unlock();
   state->db->PurgeObsoleteFiles(deletion_state);
+
   delete state;
 }
 }  // namespace
@@ -2660,7 +2693,7 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
                                       SequenceNumber* latest_snapshot) {
   IterState* cleanup = new IterState;
   MemTable* mutable_mem;
-  std::vector<MemTable*> immutables;
+  MemTableListVersion* immutable_mems;
   Version* version;
 
   // Collect together all needed child iterators for mem
@@ -2669,25 +2702,22 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
   mem_->Ref();
   mutable_mem = mem_;
   // Collect together all needed child iterators for imm_
-  imm_.GetMemTables(&immutables);
-  for (unsigned int i = 0; i < immutables.size(); i++) {
-    immutables[i]->Ref();
-  }
-  // Collect iterators for files in L0 - Ln
+  immutable_mems = imm_.current();
+  immutable_mems->Ref();
   versions_->current()->Ref();
   version = versions_->current();
   mutex_.Unlock();
 
-  std::vector<Iterator*> list;
-  list.push_back(mutable_mem->NewIterator(options));
-  cleanup->mem.push_back(mutable_mem);
-  for (MemTable* m : immutables) {
-    list.push_back(m->NewIterator(options));
-    cleanup->mem.push_back(m);
-  }
-  version->AddIterators(options, storage_options_, &list);
-  Iterator* internal_iter =
-      NewMergingIterator(&internal_comparator_, &list[0], list.size());
+  std::vector<Iterator*> iterator_list;
+  iterator_list.push_back(mutable_mem->NewIterator(options));
+  cleanup->mem = mutable_mem;
+  cleanup->imm = immutable_mems;
+  // Collect all needed child iterators for immutable memtables
+  immutable_mems->AddIterators(options, &iterator_list);
+  // Collect iterators for files in L0 - Ln
+  version->AddIterators(options, storage_options_, &iterator_list);
+  Iterator* internal_iter = NewMergingIterator(
+      &internal_comparator_, &iterator_list[0], iterator_list.size());
   cleanup->version = version;
   cleanup->mu = &mutex_;
   cleanup->db = this;
@@ -2699,6 +2729,60 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
 Iterator* DBImpl::TEST_NewInternalIterator() {
   SequenceNumber ignored;
   return NewInternalIterator(ReadOptions(), &ignored);
+}
+
+std::pair<Iterator*, Iterator*> DBImpl::GetTailingIteratorPair(
+    const ReadOptions& options,
+    uint64_t* superversion_number) {
+
+  MemTable* mutable_mem;
+  MemTableListVersion* immutable_mems;
+  Version* version;
+
+  // get all child iterators and bump their refcounts under lock
+  mutex_.Lock();
+  mutable_mem = mem_;
+  mutable_mem->Ref();
+  immutable_mems = imm_.current();
+  immutable_mems->Ref();
+  version = versions_->current();
+  version->Ref();
+  if (superversion_number != nullptr) {
+    *superversion_number = CurrentVersionNumber();
+  }
+  mutex_.Unlock();
+
+  Iterator* mutable_iter = mutable_mem->NewIterator(options);
+  IterState* mutable_cleanup = new IterState();
+  mutable_cleanup->mem = mutable_mem;
+  mutable_cleanup->db = this;
+  mutable_cleanup->mu = &mutex_;
+  mutable_iter->RegisterCleanup(CleanupIteratorState, mutable_cleanup, nullptr);
+
+  // create a DBIter that only uses memtable content; see NewIterator()
+  mutable_iter = NewDBIterator(&dbname_, env_, options_, user_comparator(),
+                               mutable_iter, kMaxSequenceNumber);
+
+  Iterator* immutable_iter;
+  IterState* immutable_cleanup = new IterState();
+  std::vector<Iterator*> list;
+  immutable_mems->AddIterators(options, &list);
+  immutable_cleanup->imm = immutable_mems;
+  version->AddIterators(options, storage_options_, &list);
+  immutable_cleanup->version = version;
+  immutable_cleanup->db = this;
+  immutable_cleanup->mu = &mutex_;
+
+  immutable_iter =
+    NewMergingIterator(&internal_comparator_, &list[0], list.size());
+  immutable_iter->RegisterCleanup(CleanupIteratorState, immutable_cleanup,
+                                  nullptr);
+
+  // create a DBIter that only uses memtable content; see NewIterator()
+  immutable_iter = NewDBIterator(&dbname_, env_, options_, user_comparator(),
+                                 immutable_iter, kMaxSequenceNumber);
+
+  return std::make_pair(mutable_iter, immutable_iter);
 }
 
 int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes() {
@@ -2740,9 +2824,10 @@ void DBImpl::InstallSuperVersion(DeletionState& deletion_state) {
 DBImpl::SuperVersion* DBImpl::InstallSuperVersion(
     SuperVersion* new_superversion) {
   mutex_.AssertHeld();
-  new_superversion->Init(mem_, imm_, versions_->current());
+  new_superversion->Init(mem_, imm_.current(), versions_->current());
   SuperVersion* old_superversion = super_version_;
   super_version_ = new_superversion;
+  ++super_version_number_;
   if (old_superversion != nullptr && old_superversion->Unref()) {
     old_superversion->Cleanup();
     return old_superversion; // will let caller delete outside of mutex
@@ -2782,7 +2867,7 @@ Status DBImpl::GetImpl(const ReadOptions& options,
   if (get_version->mem->Get(lkey, value, &s, merge_context, options_)) {
     // Done
     RecordTick(options_.statistics.get(), MEMTABLE_HIT);
-  } else if (get_version->imm.Get(lkey, value, &s, merge_context, options_)) {
+  } else if (get_version->imm->Get(lkey, value, &s, merge_context, options_)) {
     // Done
     RecordTick(options_.statistics.get(), MEMTABLE_HIT);
   } else {
@@ -2837,10 +2922,10 @@ std::vector<Status> DBImpl::MultiGet(const ReadOptions& options,
   }
 
   MemTable* mem = mem_;
-  MemTableList imm = imm_;
+  MemTableListVersion* imm = imm_.current();
   Version* current = versions_->current();
   mem->Ref();
-  imm.RefAll();
+  imm->Ref();
   current->Ref();
 
   // Unlock while reading from files and memtables
@@ -2872,7 +2957,7 @@ std::vector<Status> DBImpl::MultiGet(const ReadOptions& options,
     LookupKey lkey(keys[i], snapshot);
     if (mem->Get(lkey, value, &s, merge_context, options_)) {
       // Done
-    } else if (imm.Get(lkey, value, &s, merge_context, options_)) {
+    } else if (imm->Get(lkey, value, &s, merge_context, options_)) {
       // Done
     } else {
       current->Get(options, lkey, value, &s, &merge_context, &stats, options_);
@@ -2891,7 +2976,7 @@ std::vector<Status> DBImpl::MultiGet(const ReadOptions& options,
     MaybeScheduleFlushOrCompaction();
   }
   MemTable* m = mem->Unref();
-  imm.UnrefAll(&to_delete);
+  imm->Unref(&to_delete);
   current->Unref();
   mutex_.Unlock();
 
@@ -2925,13 +3010,21 @@ bool DBImpl::KeyMayExist(const ReadOptions& options,
 }
 
 Iterator* DBImpl::NewIterator(const ReadOptions& options) {
-  SequenceNumber latest_snapshot;
-  Iterator* iter = NewInternalIterator(options, &latest_snapshot);
-  iter = NewDBIterator(
-             &dbname_, env_, options_, user_comparator(), iter,
-             (options.snapshot != nullptr
-              ? reinterpret_cast<const SnapshotImpl*>(options.snapshot)->number_
-              : latest_snapshot));
+  Iterator* iter;
+
+  if (options.tailing) {
+    iter = new TailingIterator(this, options, user_comparator());
+  } else {
+    SequenceNumber latest_snapshot;
+    iter = NewInternalIterator(options, &latest_snapshot);
+
+    iter = NewDBIterator(
+      &dbname_, env_, options_, user_comparator(), iter,
+      (options.snapshot != nullptr
+       ? reinterpret_cast<const SnapshotImpl*>(options.snapshot)->number_
+       : latest_snapshot));
+  }
+
   if (options.prefix) {
     // use extra wrapper to exclude any keys from the results which
     // don't begin with the prefix
@@ -3062,8 +3155,8 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
           // have succeeded in memtable but Status reports error for all writes.
           throw std::runtime_error("In memory WriteBatch corruption!");
         }
-        SetTickerCount(options_.statistics.get(),
-                       SEQUENCE_NUMBER, last_sequence);
+        SetTickerCount(options_.statistics.get(), SEQUENCE_NUMBER,
+                       last_sequence);
       }
       if (updates == &tmp_batch_) tmp_batch_.Clear();
       mutex_.Lock();
@@ -3155,7 +3248,7 @@ void DBImpl::BuildBatchGroup(Writer** last_writer,
 // The goal of this formula is to gradually increase the rate at which writes
 // are slowed. We also tried linear delay (r * 1000), but it seemed to do
 // slightly worse. There is no other particular reason for choosing quadratic.
-uint64_t DBImpl::SlowdownAmount(int n, int top, int bottom) {
+uint64_t DBImpl::SlowdownAmount(int n, double bottom, double top) {
   uint64_t delay;
   if (n >= top) {
     delay = 1000;
@@ -3167,10 +3260,10 @@ uint64_t DBImpl::SlowdownAmount(int n, int top, int bottom) {
     // If we are here, we know that:
     //   level0_start_slowdown <= n < level0_slowdown
     // since the previous two conditions are false.
-    float how_much =
-      (float) (n - bottom) /
+    double how_much =
+      (double) (n - bottom) /
               (top - bottom);
-    delay = how_much * how_much * 1000;
+    delay = std::max(how_much * how_much * 1000, 100.0);
   }
   assert(delay <= 1000);
   return delay;
@@ -3202,15 +3295,15 @@ Status DBImpl::MakeRoomForWrite(bool force,
       // individual write by 0-1ms to reduce latency variance.  Also,
       // this delay hands over some CPU to the compaction thread in
       // case it is sharing the same core as the writer.
+      uint64_t slowdown =
+          SlowdownAmount(versions_->current()->NumLevelFiles(0),
+                         options_.level0_slowdown_writes_trigger,
+                         options_.level0_stop_writes_trigger);
       mutex_.Unlock();
       uint64_t delayed;
       {
         StopWatch sw(env_, options_.statistics.get(), STALL_L0_SLOWDOWN_COUNT);
-        env_->SleepForMicroseconds(
-          SlowdownAmount(versions_->current()->NumLevelFiles(0),
-                         options_.level0_slowdown_writes_trigger,
-                         options_.level0_stop_writes_trigger)
-        );
+        env_->SleepForMicroseconds(slowdown);
         delayed = sw.ElapsedMicros();
       }
       RecordTick(options_.statistics.get(), STALL_L0_SLOWDOWN_MICROS, delayed);
@@ -3828,8 +3921,7 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     return s;
   }
   impl->mutex_.Lock();
-  VersionEdit edit;
-  s = impl->Recover(&edit); // Handles create_if_missing, error_if_exists
+  s = impl->Recover(); // Handles create_if_missing, error_if_exists
   if (s.ok()) {
     uint64_t new_log_number = impl->versions_->NewFileNumber();
     unique_ptr<WritableFile> lfile;
@@ -3841,6 +3933,7 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     );
     if (s.ok()) {
       lfile->SetPreallocationBlockSize(1.1 * impl->options_.write_buffer_size);
+      VersionEdit edit;
       edit.SetLogNumber(new_log_number);
       impl->logfile_number_ = new_log_number;
       impl->log_.reset(new log::Writer(std::move(lfile)));

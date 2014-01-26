@@ -10,6 +10,7 @@
 #include <atomic>
 #include <deque>
 #include <set>
+#include <utility>
 #include <vector>
 #include "db/dbformat.h"
 #include "db/log_writer.h"
@@ -63,8 +64,8 @@ class DBImpl : public DB {
   virtual void ReleaseSnapshot(const Snapshot* snapshot);
   virtual bool GetProperty(const Slice& property, std::string* value);
   virtual void GetApproximateSizes(const Range* range, int n, uint64_t* sizes);
-  virtual void CompactRange(const Slice* begin, const Slice* end,
-                            bool reduce_level = false, int target_level = -1);
+  virtual Status CompactRange(const Slice* begin, const Slice* end,
+                              bool reduce_level = false, int target_level = -1);
   virtual int NumberLevels();
   virtual int MaxMemCompactionLevel();
   virtual int Level0StopWriteTrigger();
@@ -89,17 +90,17 @@ class DBImpl : public DB {
 
   virtual Status GetDbIdentity(std::string& identity);
 
-  void RunManualCompaction(int input_level,
-                           int output_level,
-                           const Slice* begin,
-                           const Slice* end);
+  Status RunManualCompaction(int input_level,
+                             int output_level,
+                             const Slice* begin,
+                             const Slice* end);
 
   // Extra methods (for testing) that are not in the public DB interface
 
   // Compact any files in the named level that overlap [*begin, *end]
-  void TEST_CompactRange(int level,
-                         const Slice* begin,
-                         const Slice* end);
+  Status TEST_CompactRange(int level,
+                           const Slice* begin,
+                           const Slice* end);
 
   // Force current memtable contents to be flushed.
   Status TEST_FlushMemTable();
@@ -139,10 +140,10 @@ class DBImpl : public DB {
   // holds references to memtable, all immutable memtables and version
   struct SuperVersion {
     MemTable* mem;
-    MemTableList imm;
+    MemTableListVersion* imm;
     Version* current;
     std::atomic<uint32_t> refs;
-    // We need to_delete because during Cleanup(), imm.UnrefAll() returns
+    // We need to_delete because during Cleanup(), imm->Unref() returns
     // all memtables that we need to free through this vector. We then
     // delete all those memtables outside of mutex, during destruction
     std::vector<MemTable*> to_delete;
@@ -160,7 +161,7 @@ class DBImpl : public DB {
     // that needs to be deleted in to_delete vector. Unrefing those
     // objects needs to be done in the mutex
     void Cleanup();
-    void Init(MemTable* new_mem, const MemTableList& new_imm,
+    void Init(MemTable* new_mem, MemTableListVersion* new_imm,
               Version* new_current);
   };
 
@@ -256,16 +257,15 @@ class DBImpl : public DB {
 
  private:
   friend class DB;
+  friend class TailingIterator;
   struct CompactionState;
   struct Writer;
 
   Status NewDB();
 
   // Recover the descriptor from persistent storage.  May do a significant
-  // amount of work to recover recently logged updates.  Any changes to
-  // be made to the descriptor are added to *edit.
-  Status Recover(VersionEdit* edit, MemTable* external_table = nullptr,
-      bool error_if_log_file_exist = false);
+  // amount of work to recover recently logged updates.
+  Status Recover(bool read_only = false, bool error_if_log_file_exist = false);
 
   void MaybeIgnoreError(Status* s) const;
 
@@ -279,10 +279,8 @@ class DBImpl : public DB {
   Status FlushMemTableToOutputFile(bool* madeProgress,
                                    DeletionState& deletion_state);
 
-  Status RecoverLogFile(uint64_t log_number,
-                        VersionEdit* edit,
-                        SequenceNumber* max_sequence,
-                        MemTable* external_table);
+  Status RecoverLogFile(uint64_t log_number, SequenceNumber* max_sequence,
+                        bool read_only);
 
   // The following two methods are used to flush a memtable to
   // storage. The first one is used atdatabase RecoveryTime (when the
@@ -293,7 +291,7 @@ class DBImpl : public DB {
   Status WriteLevel0Table(std::vector<MemTable*> &mems, VersionEdit* edit,
                                 uint64_t* filenumber);
 
-  uint64_t SlowdownAmount(int n, int top, int bottom);
+  uint64_t SlowdownAmount(int n, double bottom, double top);
   // MakeRoomForWrite will return superversion_to_free through an arugment,
   // which the caller needs to delete. We do it because caller can delete
   // the superversion outside of mutex
@@ -361,7 +359,18 @@ class DBImpl : public DB {
   // Move the files in the input level to the target level.
   // If target_level < 0, automatically calculate the minimum level that could
   // hold the data set.
-  void ReFitLevel(int level, int target_level = -1);
+  Status ReFitLevel(int level, int target_level = -1);
+
+  // Returns the current SuperVersion number.
+  uint64_t CurrentVersionNumber() const;
+
+  // Returns a pair of iterators (mutable-only and immutable-only) used
+  // internally by TailingIterator and stores CurrentVersionNumber() in
+  // *superversion_number. These iterators are always up-to-date, i.e. can
+  // be used to read new data.
+  std::pair<Iterator*, Iterator*> GetTailingIteratorPair(
+    const ReadOptions& options,
+    uint64_t* superversion_number);
 
   // Constant after construction
   const InternalFilterPolicy internal_filter_policy_;
@@ -384,6 +393,11 @@ class DBImpl : public DB {
   unique_ptr<log::Writer> log_;
 
   SuperVersion* super_version_;
+
+  // An ordinal representing the current SuperVersion. Updated by
+  // InstallSuperVersion(), i.e. incremented every time super_version_
+  // changes.
+  std::atomic<uint64_t> super_version_number_;
 
   std::string host_name_;
 
@@ -416,6 +430,7 @@ class DBImpl : public DB {
     int input_level;
     int output_level;
     bool done;
+    Status status;
     bool in_progress;           // compaction request being processed?
     const InternalKey* begin;   // nullptr means beginning of key range
     const InternalKey* end;     // nullptr means end of key range
