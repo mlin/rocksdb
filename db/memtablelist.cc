@@ -31,6 +31,7 @@ MemTableListVersion::MemTableListVersion(MemTableListVersion* old) {
 void MemTableListVersion::Ref() { ++refs_; }
 
 void MemTableListVersion::Unref(std::vector<MemTable*>* to_delete) {
+  assert(refs_ >= 1);
   --refs_;
   if (refs_ == 0) {
     // if to_delete is equal to nullptr it means we're confident
@@ -75,17 +76,16 @@ void MemTableListVersion::AddIterators(const ReadOptions& options,
   }
 }
 
+// caller is responsible for referencing m
 void MemTableListVersion::Add(MemTable* m) {
   assert(refs_ == 1);  // only when refs_ == 1 is MemTableListVersion mutable
-  m->Ref();
   memlist_.push_front(m);
   ++size_;
 }
 
+// caller is responsible for unreferencing m
 void MemTableListVersion::Remove(MemTable* m) {
   assert(refs_ == 1);  // only when refs_ == 1 is MemTableListVersion mutable
-  MemTable* x __attribute__((unused)) = m->Unref();
-  assert(x == nullptr);  // it still needs to be alive!
   memlist_.remove(m);
   --size_;
 }
@@ -121,12 +121,10 @@ void MemTableList::PickMemtablesToFlush(std::vector<MemTable*>* ret) {
 
 // Record a successful flush in the manifest file
 Status MemTableList::InstallMemtableFlushResults(
-                      const std::vector<MemTable*> &mems,
-                      VersionSet* vset, Status flushStatus,
-                      port::Mutex* mu, Logger* info_log,
-                      uint64_t file_number,
-                      std::set<uint64_t>& pending_outputs,
-                      std::vector<MemTable*>* to_delete) {
+    const std::vector<MemTable*>& mems, VersionSet* vset, Status flushStatus,
+    port::Mutex* mu, Logger* info_log, uint64_t file_number,
+    std::set<uint64_t>& pending_outputs, std::vector<MemTable*>* to_delete,
+    Directory* db_directory) {
   mu->AssertHeld();
 
   // If the flush was not successful, then just reset state.
@@ -178,7 +176,7 @@ Status MemTableList::InstallMemtableFlushResults(
         (unsigned long)m->file_number_);
 
     // this can release and reacquire the mutex.
-    s = vset->LogAndApply(&m->edit_, mu);
+    s = vset->LogAndApply(&m->edit_, mu, db_directory);
 
     // we will be changing the version in the next code path,
     // so we better create a new one, since versions are immutable
@@ -231,6 +229,11 @@ Status MemTableList::InstallMemtableFlushResults(
 void MemTableList::Add(MemTable* m) {
   assert(current_->size_ >= num_flush_not_started_);
   InstallNewVersion();
+  // this method is used to move mutable memtable into an immutable list.
+  // since mutable memtable is already refcounted by the DBImpl,
+  // and when moving to the imutable list we don't unref it,
+  // we don't have to ref the memtable here. we just take over the
+  // reference from the DBImpl.
   current_->Add(m);
   m->MarkImmutable();
   num_flush_not_started_++;
@@ -255,6 +258,7 @@ void MemTableList::InstallNewVersion() {
     // somebody else holds the current version, we need to create new one
     MemTableListVersion* version = current_;
     current_ = new MemTableListVersion(current_);
+    current_->Ref();
     version->Unref();
   }
 }

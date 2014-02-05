@@ -40,16 +40,16 @@ class MemTableListVersion {
   void AddIterators(const ReadOptions& options,
                     std::vector<Iterator*>* iterator_list);
 
+ private:
   // REQUIRE: m is mutable memtable
   void Add(MemTable* m);
   // REQUIRE: m is mutable memtable
   void Remove(MemTable* m);
 
- private:
   friend class MemTableList;
   std::list<MemTable*> memlist_;
   int size_ = 0;
-  int refs_ = 1;
+  int refs_ = 0;
 };
 
 // This class stores references to all the immutable memtables.
@@ -90,12 +90,13 @@ class MemTableList {
   void PickMemtablesToFlush(std::vector<MemTable*>* mems);
 
   // Commit a successful flush in the manifest file
-  Status InstallMemtableFlushResults(const std::vector<MemTable*> &m,
-                      VersionSet* vset, Status flushStatus,
-                      port::Mutex* mu, Logger* info_log,
-                      uint64_t file_number,
-                      std::set<uint64_t>& pending_outputs,
-                      std::vector<MemTable*>* to_delete);
+  Status InstallMemtableFlushResults(const std::vector<MemTable*>& m,
+                                     VersionSet* vset, Status flushStatus,
+                                     port::Mutex* mu, Logger* info_log,
+                                     uint64_t file_number,
+                                     std::set<uint64_t>& pending_outputs,
+                                     std::vector<MemTable*>* to_delete,
+                                     Directory* db_directory);
 
   // New memtables are inserted at the front of the list.
   // Takes ownership of the referenced held on *m by the caller of Add().

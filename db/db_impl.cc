@@ -881,6 +881,11 @@ Status DBImpl::Recover(bool read_only, bool error_if_log_file_exist) {
       return s;
     }
 
+    s = env_->NewDirectory(dbname_, &db_directory_);
+    if (!s.ok()) {
+      return s;
+    }
+
     s = env_->LockFile(LockFileName(dbname_), &db_lock_);
     if (!s.ok()) {
       return s;
@@ -1173,6 +1178,9 @@ Status DBImpl::WriteLevel0Table(std::vector<MemTable*> &mems, VersionEdit* edit,
         (unsigned long) meta.number,
         (unsigned long) meta.file_size,
         s.ToString().c_str());
+    if (!options_.disableDataSync) {
+      db_directory_->Fsync();
+    }
     mutex_.Lock();
   }
   base->Unref();
@@ -1267,8 +1275,8 @@ Status DBImpl::FlushMemTableToOutputFile(bool* madeProgress,
 
   // Replace immutable memtable with the generated Table
   s = imm_.InstallMemtableFlushResults(
-    mems, versions_.get(), s, &mutex_, options_.info_log.get(),
-    file_number, pending_outputs_, &deletion_state.memtables_to_free);
+      mems, versions_.get(), s, &mutex_, options_.info_log.get(), file_number,
+      pending_outputs_, &deletion_state.memtables_to_free, db_directory_.get());
 
   if (s.ok()) {
     InstallSuperVersion(deletion_state);
@@ -1397,7 +1405,7 @@ Status DBImpl::ReFitLevel(int level, int target_level) {
     Log(options_.info_log, "Apply version edit:\n%s",
         edit.DebugString().data());
 
-    status = versions_->LogAndApply(&edit, &mutex_);
+    status = versions_->LogAndApply(&edit, &mutex_, db_directory_.get());
     superversion_to_free = InstallSuperVersion(new_superversion);
     new_superversion = nullptr;
 
@@ -1776,7 +1784,7 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
     // max_background_compactions hasn't been reached and, in case
     // bg_manual_only_ > 0, if it's a manual compaction.
     if ((manual_compaction_ ||
-         versions_->NeedsCompaction() ||
+         versions_->current()->NeedsCompaction() ||
          (is_flush_pending && (options_.max_background_flushes <= 0))) &&
         bg_compaction_scheduled_ < options_.max_background_compactions &&
         (!bg_manual_only_ || manual_compaction_)) {
@@ -1969,7 +1977,7 @@ Status DBImpl::BackgroundCompaction(bool* madeProgress,
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size,
                        f->smallest, f->largest,
                        f->smallest_seqno, f->largest_seqno);
-    status = versions_->LogAndApply(c->edit(), &mutex_);
+    status = versions_->LogAndApply(c->edit(), &mutex_, db_directory_.get());
     InstallSuperVersion(deletion_state);
     Version::LevelSummaryStorage tmp;
     Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
@@ -2217,7 +2225,8 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
         compact->compaction->output_level(), out.number, out.file_size,
         out.smallest, out.largest, out.smallest_seqno, out.largest_seqno);
   }
-  return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+  return versions_->LogAndApply(compact->compaction->edit(), &mutex_,
+                                db_directory_.get());
 }
 
 //
@@ -2590,6 +2599,9 @@ Status DBImpl::DoCompactionWork(CompactionState* compact,
   }
   input.reset();
 
+  if (!options_.disableDataSync) {
+    db_directory_->Fsync();
+  }
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros - imm_micros;
   MeasureTime(options_.statistics.get(), COMPACTION_TIME, stats.micros);
@@ -3350,12 +3362,11 @@ Status DBImpl::MakeRoomForWrite(bool force,
       RecordTick(options_.statistics.get(), STALL_L0_NUM_FILES_MICROS, stall);
       stall_level0_num_files_ += stall;
       stall_level0_num_files_count_++;
-    } else if (
-        allow_hard_rate_limit_delay &&
-        options_.hard_rate_limit > 1.0 &&
-        (score = versions_->MaxCompactionScore()) > options_.hard_rate_limit) {
+    } else if (allow_hard_rate_limit_delay && options_.hard_rate_limit > 1.0 &&
+               (score = versions_->current()->MaxCompactionScore()) >
+                   options_.hard_rate_limit) {
       // Delay a write when the compaction score for any level is too large.
-      int max_level = versions_->MaxCompactionScoreLevel();
+      int max_level = versions_->current()->MaxCompactionScoreLevel();
       mutex_.Unlock();
       uint64_t delayed;
       {
@@ -3377,10 +3388,9 @@ Status DBImpl::MakeRoomForWrite(bool force,
         allow_hard_rate_limit_delay = false;
       }
       mutex_.Lock();
-    } else if (
-        allow_soft_rate_limit_delay &&
-        options_.soft_rate_limit > 0.0 &&
-        (score = versions_->MaxCompactionScore()) > options_.soft_rate_limit) {
+    } else if (allow_soft_rate_limit_delay && options_.soft_rate_limit > 0.0 &&
+               (score = versions_->current()->MaxCompactionScore()) >
+                   options_.soft_rate_limit) {
       // Delay a write when the compaction score for any level is too large.
       // TODO: add statistics
       mutex_.Unlock();
@@ -3535,8 +3545,8 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
     // Pardon the long line but I think it is easier to read this way.
     snprintf(buf, sizeof(buf),
              "                               Compactions\n"
-             "Level  Files Size(MB) Score Time(sec)  Read(MB) Write(MB)    Rn(MB)  Rnp1(MB)  Wnew(MB) RW-Amplify Read(MB/s) Write(MB/s)      Rn     Rnp1     Wnp1     NewW    Count  Ln-stall Stall-cnt\n"
-             "--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n"
+             "Level  Files Size(MB) Score Time(sec)  Read(MB) Write(MB)    Rn(MB)  Rnp1(MB)  Wnew(MB) RW-Amplify Read(MB/s) Write(MB/s)      Rn     Rnp1     Wnp1     NewW    Count   msComp   msStall  Ln-stall Stall-cnt\n"
+             "------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n"
              );
     value->append(buf);
     for (int level = 0; level < current->NumberLevels(); level++) {
@@ -3556,9 +3566,21 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
         total_bytes_read += bytes_read;
         total_bytes_written += stats_[level].bytes_written;
 
+        uint64_t stalls = level == 0 ?
+            (stall_level0_slowdown_count_ +
+             stall_level0_num_files_count_ +
+             stall_memtable_compaction_count_) :
+            stall_leveln_slowdown_count_[level];
+
+        double stall_us = level == 0 ?
+            (stall_level0_slowdown_ +
+             stall_level0_num_files_ +
+             stall_memtable_compaction_) :
+            stall_leveln_slowdown_[level];
+
         snprintf(
             buf, sizeof(buf),
-            "%3d %8d %8.0f %5.1f %9.0f %9.0f %9.0f %9.0f %9.0f %9.0f %10.1f %9.1f %11.1f %8d %8d %8d %8d %8d %9.1f %9lu\n",
+            "%3d %8d %8.0f %5.1f %9.0f %9.0f %9.0f %9.0f %9.0f %9.0f %10.1f %9.1f %11.1f %8d %8d %8d %8d %8d %8d %9.1f %9.1f %9lu\n",
             level,
             files,
             current->NumLevelBytes(level) / 1048576.0,
@@ -3580,8 +3602,13 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
             stats_[level].files_out_levelnp1,
             stats_[level].files_out_levelnp1 - stats_[level].files_in_levelnp1,
             stats_[level].count,
-            stall_leveln_slowdown_[level] / 1000000.0,
-            (unsigned long) stall_leveln_slowdown_count_[level]);
+            (int) ((double) stats_[level].micros /
+                   1000.0 /
+                   (stats_[level].count + 1)),
+            (double) stall_us / 1000.0 / (stalls + 1),
+            stall_us / 1000000.0,
+            (unsigned long) stalls);
+
         total_slowdown += stall_leveln_slowdown_[level];
         total_slowdown_count += stall_leveln_slowdown_count_[level];
         value->append(buf);
@@ -3829,7 +3856,7 @@ Status DBImpl::DeleteFile(std::string name) {
       }
     }
     edit.DeleteFile(level, number);
-    status = versions_->LogAndApply(&edit, &mutex_);
+    status = versions_->LogAndApply(&edit, &mutex_, db_directory_.get());
     if (status.ok()) {
       InstallSuperVersion(deletion_state);
     }
@@ -3937,7 +3964,8 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
       edit.SetLogNumber(new_log_number);
       impl->logfile_number_ = new_log_number;
       impl->log_.reset(new log::Writer(std::move(lfile)));
-      s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
+      s = impl->versions_->LogAndApply(&edit, &impl->mutex_,
+                                       impl->db_directory_.get());
     }
     if (s.ok()) {
       delete impl->InstallSuperVersion(new DBImpl::SuperVersion());
@@ -3945,6 +3973,7 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
       impl->DeleteObsoleteFiles();
       impl->MaybeScheduleFlushOrCompaction();
       impl->MaybeScheduleLogDBDeployStats();
+      s = impl->db_directory_->Fsync();
     }
   }
 

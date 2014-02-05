@@ -756,6 +756,28 @@ void Version::Unref() {
   }
 }
 
+bool Version::NeedsCompaction() const {
+  if (file_to_compact_ != nullptr) {
+    return true;
+  }
+  // In universal compaction case, this check doesn't really
+  // check the compaction condition, but checks num of files threshold
+  // only. We are not going to miss any compaction opportunity
+  // but it's likely that more compactions are scheduled but
+  // ending up with nothing to do. We can improve it later.
+  // TODO(sdong): improve this function to be accurate for universal
+  //              compactions.
+  int num_levels_to_check =
+    (vset_->options_->compaction_style != kCompactionStyleUniversal) ?
+    NumberLevels() - 1 : 1;
+  for (int i = 0; i < num_levels_to_check; i++) {
+    if (compaction_score_[i] >= 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool Version::OverlapInLevel(int level,
                              const Slice* smallest_user_key,
                              const Slice* largest_user_key) {
@@ -1397,6 +1419,7 @@ void VersionSet::AppendVersion(Version* v) {
 }
 
 Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu,
+                               Directory* db_directory,
                                bool new_descriptor_log) {
   mu->AssertHeld();
 
@@ -1519,10 +1542,15 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu,
         // of it later
         env_->DeleteFile(DescriptorFileName(dbname_, old_manifest_file_number));
       }
+      if (!options_->disableDataSync && db_directory != nullptr) {
+        db_directory->Fsync();
+      }
     }
 
-    // find offset in manifest file where this version is stored.
-    new_manifest_file_size = descriptor_log_->file()->GetFileSize();
+    if (s.ok()) {
+      // find offset in manifest file where this version is stored.
+      new_manifest_file_size = descriptor_log_->file()->GetFileSize();
+    }
 
     LogFlush(options_->info_log);
     mu->Lock();
@@ -1799,7 +1827,7 @@ Status VersionSet::ReduceNumberOfLevels(const std::string& dbname,
   VersionEdit ve;
   port::Mutex dummy_mutex;
   MutexLock l(&dummy_mutex);
-  return versions.LogAndApply(&ve, &dummy_mutex, true);
+  return versions.LogAndApply(&ve, &dummy_mutex, nullptr, true);
 }
 
 Status VersionSet::DumpManifest(Options& options, std::string& dscname,
